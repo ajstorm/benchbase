@@ -25,8 +25,11 @@ import com.oltpbenchmark.benchmarks.tpcc.TPCCWorker;
 import com.oltpbenchmark.benchmarks.tpcc.pojo.Customer;
 import com.oltpbenchmark.benchmarks.tpcc.pojo.District;
 import com.oltpbenchmark.benchmarks.tpcc.pojo.Warehouse;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.sql.*;
+import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Random;
 import org.slf4j.Logger;
@@ -54,23 +57,48 @@ public class Payment extends TPCCProcedure {
     """
               .formatted(TPCCConstants.TABLENAME_WAREHOUSE));
 
-  public SQLStmt payUpdateDistSQL =
+  // SQL statement for warehouse update with RETURNING
+  public SQLStmt payUpdateWhseReturningSQLPostgres =
+      new SQLStmt(
+          """
+        UPDATE %s
+           SET W_YTD = W_YTD + ?
+         WHERE W_ID = ?
+         RETURNING W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP, W_NAME
+    """
+              .formatted(TPCCConstants.TABLENAME_WAREHOUSE));
+
+  public SQLStmt payUpdateWhseReturningSQLOracle =
+      new SQLStmt(
+          """
+        UPDATE %s
+           SET W_YTD = W_YTD + ?
+         WHERE W_ID = ?
+         RETURNING W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP, W_NAME
+           INTO ?, ?, ?, ?, ?, ?
+    """
+              .formatted(TPCCConstants.TABLENAME_WAREHOUSE));
+
+  public SQLStmt payUpdateDistSQLPostgres =
       new SQLStmt(
           """
         UPDATE %s
            SET D_YTD = D_YTD + ?
          WHERE D_W_ID = ?
            AND D_ID = ?
+         RETURNING D_STREET_1, D_STREET_2, D_CITY, D_STATE, D_ZIP, D_NAME
     """
               .formatted(TPCCConstants.TABLENAME_DISTRICT));
 
-  public SQLStmt payGetDistSQL =
+  public SQLStmt payUpdateDistSQLOracle =
       new SQLStmt(
           """
-        SELECT D_STREET_1, D_STREET_2, D_CITY, D_STATE, D_ZIP, D_NAME
-          FROM %s
+        UPDATE %s
+           SET D_YTD = D_YTD + ?
          WHERE D_W_ID = ?
            AND D_ID = ?
+         RETURNING D_STREET_1, D_STREET_2, D_CITY, D_STATE, D_ZIP, D_NAME
+           INTO ?, ?, ?, ?, ?, ?
     """
               .formatted(TPCCConstants.TABLENAME_DISTRICT));
 
@@ -125,6 +153,70 @@ public class Payment extends TPCCProcedure {
     """
               .formatted(TPCCConstants.TABLENAME_CUSTOMER));
 
+  public SQLStmt payUpdateCustReturningSQLPostgres =
+      new SQLStmt(
+          """
+      UPDATE %s
+         SET C_BALANCE = C_BALANCE - ?,
+             C_YTD_PAYMENT = C_YTD_PAYMENT + ?,
+             C_PAYMENT_CNT = C_PAYMENT_CNT + 1,
+             C_DATA = CASE C_CREDIT
+                        WHEN 'BC' THEN SUBSTRING(? || C_DATA, 1, 500)
+                        ELSE C_DATA
+                      END
+       WHERE C_W_ID = ?
+         AND C_D_ID = ?
+         AND C_ID = ?
+       RETURNING C_FIRST, C_MIDDLE, C_LAST, C_STREET_1, C_STREET_2,
+                C_CITY, C_STATE, C_ZIP, C_PHONE, C_SINCE, C_CREDIT,
+                C_CREDIT_LIM, C_DISCOUNT, C_BALANCE, C_DATA
+  """
+              .formatted(TPCCConstants.TABLENAME_CUSTOMER));
+
+  //  public SQLStmt payUpdateCustReturningSQLOracle =
+  //      new SQLStmt(
+  //          """
+  //      UPDATE %s
+  //         SET C_BALANCE = C_BALANCE - ?,
+  //             C_YTD_PAYMENT = C_YTD_PAYMENT + ?,
+  //             C_PAYMENT_CNT = C_PAYMENT_CNT + 1,
+  //             C_DATA = CASE C_CREDIT
+  //                        WHEN 'BC' THEN CAST(SUBSTRING(? || C_DATA, 1, 500) AS VARCHAR2(500))
+  //                        ELSE C_DATA
+  //                      END
+  //       WHERE C_W_ID = ?
+  //         AND C_D_ID = ?
+  //         AND C_ID = ?
+  //       RETURNING C_FIRST, C_MIDDLE, C_LAST, C_STREET_1, C_STREET_2,
+  //                C_CITY, C_STATE, C_ZIP, C_PHONE, C_SINCE, C_CREDIT,
+  //                C_CREDIT_LIM, C_DISCOUNT, C_BALANCE,
+  //                CASE C_CREDIT WHEN 'BC' THEN C_DATA ELSE '' END AS C_DATA
+  //           INTO ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  //  """
+  //              .formatted(TPCCConstants.TABLENAME_CUSTOMER));
+
+  // FIXME: Oracle doesn't support case statements in returning clauses
+  public SQLStmt payUpdateCustReturningSQLOracle =
+      new SQLStmt(
+          """
+      UPDATE %s
+         SET C_BALANCE = C_BALANCE - ?,
+             C_YTD_PAYMENT = C_YTD_PAYMENT + ?,
+             C_PAYMENT_CNT = C_PAYMENT_CNT + 1,
+             C_DATA = CASE C_CREDIT
+                       WHEN 'BC' THEN SUBSTR(? || C_DATA, 1, 500)
+                       ELSE C_DATA
+                     END
+       WHERE C_W_ID = ?
+         AND C_D_ID = ?
+         AND C_ID = ?
+       RETURNING C_FIRST, C_MIDDLE, C_LAST, C_STREET_1, C_STREET_2,
+                C_CITY, C_STATE, C_ZIP, C_PHONE, C_SINCE, C_CREDIT,
+                C_CREDIT_LIM, C_DISCOUNT, C_BALANCE, C_DATA
+           INTO ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  """
+              .formatted(TPCCConstants.TABLENAME_CUSTOMER));
+
   public SQLStmt payInsertHistSQL =
       new SQLStmt(
           """
@@ -162,34 +254,19 @@ public class Payment extends TPCCProcedure {
 
     float paymentAmount = (float) (TPCCUtil.randomNumber(100, 500000, gen) / 100.0);
 
-    updateWarehouse(conn, w_id, paymentAmount);
+    Warehouse w = updateAndGetWarehouse(conn, w_id, paymentAmount);
 
-    Warehouse w = getWarehouse(conn, w_id);
-
-    updateDistrict(conn, w_id, districtID, paymentAmount);
-
-    District d = getDistrict(conn, w_id, districtID);
+    District d = updateAndGetDistrict(conn, w_id, districtID, paymentAmount);
 
     int x = TPCCUtil.randomNumber(1, 100, gen);
 
     int customerDistrictID = getCustomerDistrictId(gen, districtID, x);
     int customerWarehouseID = getCustomerWarehouseID(gen, w_id, numWarehouses, x);
 
-    Customer c = getCustomer(conn, gen, customerDistrictID, customerWarehouseID, paymentAmount);
-
-    if (c.c_credit.equals("BC")) {
-      // bad credit
-      c.c_data =
-          getCData(
-              conn, w_id, districtID, customerDistrictID, customerWarehouseID, paymentAmount, c);
-
-      updateBalanceCData(conn, customerDistrictID, customerWarehouseID, c);
-
-    } else {
-      // GoodCredit
-
-      updateBalance(conn, customerDistrictID, customerWarehouseID, c);
-    }
+    // Use the optimized method instead of the separate update calls
+    Customer c =
+        updateAndGetCustomer(
+            conn, gen, customerWarehouseID, customerDistrictID, paymentAmount, w_id, districtID);
 
     insertHistory(
         conn,
@@ -307,12 +384,100 @@ public class Payment extends TPCCProcedure {
     }
   }
 
+  private Warehouse updateAndGetWarehouse(Connection conn, int w_id, float paymentAmount)
+      throws SQLException {
+    Warehouse w = new Warehouse();
+
+    // Check if database supports RETURNING clause
+    boolean supportsReturning = TPCCUtil.checkIfDatabaseSupportsReturning(conn);
+
+    if (supportsReturning) {
+      String dbType = conn.getMetaData().getDatabaseProductName().toLowerCase();
+
+      if (dbType.contains("postgresql") || dbType.contains("postgres")) {
+        // Use UPDATE with RETURNING clause to do both operations in one statement
+        try (PreparedStatement stmt =
+            this.getPreparedStatement(conn, payUpdateWhseReturningSQLPostgres)) {
+          stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+          stmt.setInt(2, w_id);
+
+          try (ResultSet rs = stmt.executeQuery()) {
+            if (!rs.next()) {
+              throw new RuntimeException("W_ID=" + w_id + " not found!");
+            }
+
+            w.w_street_1 = rs.getString("W_STREET_1");
+            w.w_street_2 = rs.getString("W_STREET_2");
+            w.w_city = rs.getString("W_CITY");
+            w.w_state = rs.getString("W_STATE");
+            w.w_zip = rs.getString("W_ZIP");
+            w.w_name = rs.getString("W_NAME");
+          }
+        }
+      } else if (dbType.contains("oracle")) {
+        try (PreparedStatement stmt =
+            this.getPreparedStatement(conn, payUpdateWhseReturningSQLOracle)) {
+          // Check if it's actually an OraclePreparedStatement
+          Class<?> oraclePstmtClass = Class.forName("oracle.jdbc.OraclePreparedStatement");
+          if (oraclePstmtClass.isInstance(stmt)) {
+            // Set input parameters
+            stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+            stmt.setInt(2, w_id);
+
+            // Register output parameters using reflection
+            Method registerReturnParameter =
+                oraclePstmtClass.getMethod("registerReturnParameter", int.class, int.class);
+            for (int i = 3; i <= 8; i++) {
+              registerReturnParameter.invoke(stmt, i, Types.VARCHAR);
+            }
+
+            // Execute and get results
+            stmt.executeUpdate();
+
+            // Get result set via reflection
+            Method getReturnResultSet = oraclePstmtClass.getMethod("getReturnResultSet");
+            ResultSet rs = (ResultSet) getReturnResultSet.invoke(stmt);
+
+            if (rs.next()) {
+              w.w_street_1 = rs.getString(1);
+              w.w_street_2 = rs.getString(2);
+              w.w_city = rs.getString(3);
+              w.w_state = rs.getString(4);
+              w.w_zip = rs.getString(5);
+              w.w_name = rs.getString(6);
+            }
+          } else {
+            // Fall back to CallableStatement approach if not OraclePreparedStatement
+            LOG.warn("Falling back to Oracle slow path");
+            updateWarehouse(conn, w_id, paymentAmount);
+            w = getWarehouse(conn, w_id);
+          }
+        } catch (ClassNotFoundException
+            | NoSuchMethodException
+            | IllegalAccessException
+            | InvocationTargetException e) {
+          // Oracle JDBC driver not available or reflection failed
+          // Fall back to CallableStatement approach
+          updateWarehouse(conn, w_id, paymentAmount);
+          w = getWarehouse(conn, w_id);
+        }
+      } else {
+        throw new RuntimeException("Unsupported vendor for RETURNING");
+      }
+    } else {
+      // For databases that don't support RETURNING, use the original two-step approach
+      updateWarehouse(conn, w_id, paymentAmount);
+      w = getWarehouse(conn, w_id);
+    }
+
+    return w;
+  }
+
+  // Keep the original methods for backward compatibility or when needed separately
   private void updateWarehouse(Connection conn, int w_id, float paymentAmount) throws SQLException {
     try (PreparedStatement payUpdateWhse = this.getPreparedStatement(conn, payUpdateWhseSQL)) {
       payUpdateWhse.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
       payUpdateWhse.setInt(2, w_id);
-      // MySQL reports deadlocks due to lock upgrades:
-      // t1: read w_id = x; t2: update w_id = x; t1 update w_id = x
       int result = payUpdateWhse.executeUpdate();
       if (result == 0) {
         throw new RuntimeException("W_ID=" + w_id + " not found!");
@@ -342,6 +507,280 @@ public class Payment extends TPCCProcedure {
     }
   }
 
+  private Customer updateAndGetCustomer(
+      Connection conn,
+      Random gen,
+      int customerWarehouseID,
+      int customerDistrictID,
+      float paymentAmount,
+      int w_id,
+      int districtID)
+      throws SQLException {
+
+    // Check if database supports RETURNING clause
+    boolean supportsReturning = TPCCUtil.checkIfDatabaseSupportsReturning(conn);
+
+    // Get customer, either by name, or by ID. In the supportsReturning case,
+    // this will just generate a customer ID.
+    Customer c = getCustomer(conn, gen, customerDistrictID, customerWarehouseID, paymentAmount);
+    if (supportsReturning) {
+      String dbType = conn.getMetaData().getDatabaseProductName().toLowerCase();
+
+      // Construct the c_data prefix for BC customers - will be used if customer has bad credit
+      String dataPrefix =
+          c.c_id
+              + " "
+              + customerDistrictID
+              + " "
+              + customerWarehouseID
+              + " "
+              + districtID
+              + " "
+              + w_id
+              + " "
+              + paymentAmount
+              + " | ";
+
+      if (dbType.contains("postgresql") || dbType.contains("postgres")) {
+
+        try (PreparedStatement stmt =
+            this.getPreparedStatement(conn, payUpdateCustReturningSQLPostgres)) {
+          stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+          stmt.setFloat(2, paymentAmount);
+          stmt.setString(3, dataPrefix);
+          stmt.setInt(4, customerWarehouseID);
+          stmt.setInt(5, customerDistrictID);
+          stmt.setInt(6, c.c_id);
+
+          try (ResultSet rs = stmt.executeQuery()) {
+            if (!rs.next()) {
+              throw new RuntimeException(
+                  "C_ID="
+                      + c.c_id
+                      + " C_W_ID="
+                      + customerWarehouseID
+                      + " C_D_ID="
+                      + customerDistrictID
+                      + " not found!");
+            }
+
+            // Update the customer object with returned values
+            c.c_first = rs.getString("C_FIRST");
+            c.c_middle = rs.getString("C_MIDDLE");
+            c.c_last = rs.getString("C_LAST");
+            c.c_street_1 = rs.getString("C_STREET_1");
+            c.c_street_2 = rs.getString("C_STREET_2");
+            c.c_city = rs.getString("C_CITY");
+            c.c_state = rs.getString("C_STATE");
+            c.c_zip = rs.getString("C_ZIP");
+            c.c_phone = rs.getString("C_PHONE");
+            c.c_since = rs.getTimestamp("C_SINCE");
+            c.c_credit = rs.getString("C_CREDIT");
+            c.c_credit_lim = rs.getFloat("C_CREDIT_LIM");
+            c.c_discount = rs.getFloat("C_DISCOUNT");
+            c.c_balance = rs.getFloat("C_BALANCE");
+            c.c_data = rs.getString("C_DATA");
+          }
+        }
+      } else if (dbType.contains("oracle")) {
+        try (PreparedStatement stmt =
+            this.getPreparedStatement(conn, payUpdateCustReturningSQLOracle)) {
+          // Check if it's actually an OraclePreparedStatement
+          Class<?> oraclePstmtClass = Class.forName("oracle.jdbc.OraclePreparedStatement");
+          if (oraclePstmtClass.isInstance(stmt)) {
+            // Set input parameters (positions 1–6)
+            stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+            stmt.setFloat(2, paymentAmount);
+            stmt.setString(3, dataPrefix);
+            stmt.setInt(4, customerWarehouseID);
+            stmt.setInt(5, customerDistrictID);
+            stmt.setInt(6, c.c_id);
+
+            Method registerReturnParameter =
+                oraclePstmtClass.getMethod("registerReturnParameter", int.class, int.class);
+
+            // Register columns 7-9 as VARCHAR
+            for (int i = 7; i <= 15; i++) {
+              registerReturnParameter.invoke(stmt, i, Types.VARCHAR);
+            }
+            // Register column 16 as TIMESTAMP
+            registerReturnParameter.invoke(stmt, 16, Types.TIMESTAMP);
+            // Register column 17 as VARCHAR
+            registerReturnParameter.invoke(stmt, 17, Types.VARCHAR);
+            // Register columns 18-20 as FLOAT
+            for (int i = 18; i <= 20; i++) {
+              registerReturnParameter.invoke(stmt, i, Types.FLOAT);
+            }
+            // Register column 21 as VARCHAR
+            registerReturnParameter.invoke(stmt, 21, Types.VARCHAR);
+
+            // Execute the update statement with RETURNING clause
+            stmt.executeUpdate();
+
+            // Retrieve the returned values via a ResultSet using reflection
+            Method getReturnResultSet = oraclePstmtClass.getMethod("getReturnResultSet");
+            ResultSet rs = (ResultSet) getReturnResultSet.invoke(stmt);
+
+            if (rs.next()) {
+              c.c_first = rs.getString(1);
+              c.c_middle = rs.getString(2);
+              c.c_last = rs.getString(3);
+              c.c_street_1 = rs.getString(4);
+              c.c_street_2 = rs.getString(5);
+              c.c_city = rs.getString(6);
+              c.c_state = rs.getString(7);
+              c.c_zip = rs.getString(8);
+              c.c_phone = rs.getString(9);
+              c.c_since = rs.getTimestamp(10);
+              c.c_credit = rs.getString(11);
+              c.c_credit_lim = rs.getFloat(12);
+              c.c_discount = rs.getFloat(13);
+              c.c_balance = rs.getFloat(14);
+              c.c_data = rs.getString(15);
+            }
+          } else {
+            throw new SQLException("Statement is not an OraclePreparedStatement");
+          }
+        } catch (ClassNotFoundException
+            | NoSuchMethodException
+            | IllegalAccessException
+            | InvocationTargetException e) {
+          // FIXME: do something more elegant here.
+          throw new RuntimeException("Invalid Oracle Setup", e);
+        }
+
+        //        try (CallableStatement stmt =
+        // conn.prepareCall(payUpdateCustReturningSQLOracle.getSQL())) {
+        //          // Set input parameters (positions 1-6 in this example)
+        //          stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+        //          stmt.setFloat(2, paymentAmount);
+        //          stmt.setString(3, dataPrefix);
+        //          stmt.setInt(4, customerWarehouseID);
+        //          stmt.setInt(5, customerDistrictID);
+        //          stmt.setInt(6, c.c_id);
+        //
+        //          // Register output parameters (positions 7-21)
+        //          stmt.registerOutParameter(7, Types.VARCHAR); // first_name
+        //          stmt.registerOutParameter(8, Types.VARCHAR); // middle_name
+        //          stmt.registerOutParameter(9, Types.VARCHAR); // last_name
+        //          stmt.registerOutParameter(10, Types.VARCHAR); // street1
+        //          stmt.registerOutParameter(11, Types.VARCHAR); // street2
+        //          stmt.registerOutParameter(12, Types.VARCHAR); // city
+        //          stmt.registerOutParameter(13, Types.VARCHAR); // state
+        //          stmt.registerOutParameter(14, Types.VARCHAR); // zip
+        //          stmt.registerOutParameter(15, Types.VARCHAR); // phone
+        //          stmt.registerOutParameter(16, Types.TIMESTAMP); // since
+        //          stmt.registerOutParameter(17, Types.VARCHAR); // credit
+        //          stmt.registerOutParameter(18, Types.FLOAT); // credit_lim
+        //          stmt.registerOutParameter(19, Types.FLOAT); // discount
+        //          stmt.registerOutParameter(20, Types.FLOAT); // balance
+        //          stmt.registerOutParameter(21, Types.VARCHAR); // data
+        //
+        //          // Execute the block
+        //          stmt.execute();
+        //
+        //          // Retrieve the output values
+        //          c.c_first = stmt.getString(7);
+        //          c.c_middle = stmt.getString(8);
+        //          c.c_last = stmt.getString(9);
+        //          c.c_street_1 = stmt.getString(10);
+        //          c.c_street_2 = stmt.getString(11);
+        //          c.c_city = stmt.getString(12);
+        //          c.c_state = stmt.getString(13);
+        //          c.c_zip = stmt.getString(14);
+        //          c.c_phone = stmt.getString(15);
+        //          c.c_since = stmt.getTimestamp(16);
+        //          c.c_credit = stmt.getString(17);
+        //          c.c_credit_lim = stmt.getFloat(18);
+        //          c.c_discount = stmt.getFloat(19);
+        //          c.c_balance = stmt.getFloat(20);
+        //          c.c_data = stmt.getString(21);
+        //        }
+        //        try (PreparedStatement stmt =
+        //            this.getPreparedStatement(conn, payUpdateCustReturningSQLOracle)) {
+        //          // Check if it's actually an OraclePreparedStatement
+        //          Class<?> oraclePstmtClass =
+        // Class.forName("oracle.jdbc.OraclePreparedStatement");
+        //          if (oraclePstmtClass.isInstance(stmt)) {
+        //            // Set input parameters
+        //            stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+        //            stmt.setFloat(2, paymentAmount);
+        //            stmt.setString(3, dataPrefix);
+        //            stmt.setInt(4, customerWarehouseID);
+        //            stmt.setInt(5, customerDistrictID);
+        //            stmt.setInt(6, c.c_id);
+        //
+        //            // Register output parameters using reflection
+        //            Method registerReturnParameter =
+        //                oraclePstmtClass.getMethod("registerReturnParameter", int.class,
+        // int.class);
+        //            for (int i = 7; i <= 15; i++) {
+        //              registerReturnParameter.invoke(stmt, i, Types.VARCHAR);
+        //            }
+        //            registerReturnParameter.invoke(stmt, 16, Types.TIMESTAMP);
+        //            registerReturnParameter.invoke(stmt, 17, Types.VARCHAR);
+        //            registerReturnParameter.invoke(stmt, 18, Types.FLOAT);
+        //            registerReturnParameter.invoke(stmt, 19, Types.FLOAT);
+        //            registerReturnParameter.invoke(stmt, 20, Types.FLOAT);
+        //            registerReturnParameter.invoke(stmt, 21, Types.VARCHAR);
+        //
+        //            // Execute the update
+        //            stmt.executeUpdate();
+        //
+        //            // Dynamically access OraclePreparedStatement methods
+        //            Object oracleStmt = oraclePstmtClass.cast(stmt); // Cast to the oracle
+        // specific class.
+        //
+        //            Method getStringMethod = oraclePstmtClass.getMethod("getString", int.class);
+        //            Method getTimestampMethod = oraclePstmtClass.getMethod("getTimestamp",
+        // int.class);
+        //            Method getFloatMethod = oraclePstmtClass.getMethod("getFloat", int.class);
+        //
+        //            c.c_first = (String) getStringMethod.invoke(oracleStmt, 7);
+        //            c.c_middle = (String) getStringMethod.invoke(oracleStmt, 8);
+        //            c.c_last = (String) getStringMethod.invoke(oracleStmt, 9);
+        //            c.c_street_1 = (String) getStringMethod.invoke(oracleStmt, 10);
+        //            c.c_street_2 = (String) getStringMethod.invoke(oracleStmt, 11);
+        //            c.c_city = (String) getStringMethod.invoke(oracleStmt, 12);
+        //            c.c_state = (String) getStringMethod.invoke(oracleStmt, 13);
+        //            c.c_zip = (String) getStringMethod.invoke(oracleStmt, 14);
+        //            c.c_phone = (String) getStringMethod.invoke(oracleStmt, 15);
+        //            c.c_since = (Timestamp) getTimestampMethod.invoke(oracleStmt, 16);
+        //            c.c_credit = (String) getStringMethod.invoke(oracleStmt, 17);
+        //            c.c_credit_lim = (Float) getFloatMethod.invoke(oracleStmt, 18);
+        //            c.c_discount = (Float) getFloatMethod.invoke(oracleStmt, 19);
+        //            c.c_balance = (Float) getFloatMethod.invoke(oracleStmt, 20);
+        //            c.c_data = (String) getStringMethod.invoke(oracleStmt, 21);
+        //          } else {
+        //            // FIXME: do something more elegant here.
+        //            throw new RuntimeException("Invalid Oracle Setup");
+        //          }
+        //        } catch (ClassNotFoundException
+        //            | NoSuchMethodException
+        //            | IllegalAccessException
+        //            | InvocationTargetException e) {
+        //          // FIXME: do something more elegant here.
+        //          throw new RuntimeException("Invalid Oracle Setup", e);
+        //        }
+      }
+    } else {
+      if (c.c_credit.equals("BC")) {
+        // bad credit
+        c.c_data =
+            getCData(
+                conn, w_id, districtID, customerDistrictID, customerWarehouseID, paymentAmount, c);
+
+        updateBalanceCData(conn, customerDistrictID, customerWarehouseID, c);
+
+      } else {
+        // GoodCredit
+
+        updateBalance(conn, customerDistrictID, customerWarehouseID, c);
+      }
+    }
+    return c;
+  }
+
   private Customer getCustomer(
       Connection conn,
       Random gen,
@@ -351,7 +790,10 @@ public class Payment extends TPCCProcedure {
       throws SQLException {
     int y = TPCCUtil.randomNumber(1, 100, gen);
 
-    Customer c;
+    Customer c = new Customer();
+
+    // Check if database supports RETURNING clause
+    boolean supportsReturning = TPCCUtil.checkIfDatabaseSupportsReturning(conn);
 
     if (y <= 60) {
       // 60% lookups by last name
@@ -363,54 +805,96 @@ public class Payment extends TPCCProcedure {
               conn);
     } else {
       // 40% lookups by customer ID
-      c =
-          getCustomerById(
-              customerWarehouseID, customerDistrictID, TPCCUtil.getCustomerID(gen), conn);
+      if (supportsReturning) {
+        // In the RETURNING case, we will lookup the customer by ID later, so
+        // we don't need to query the row directly here.
+        c.c_id = TPCCUtil.getCustomerID(gen);
+      } else {
+        c =
+            getCustomerById(
+                customerWarehouseID, customerDistrictID, TPCCUtil.getCustomerID(gen), conn);
+      }
     }
 
-    c.c_balance -= paymentAmount;
-    c.c_ytd_payment += paymentAmount;
-    c.c_payment_cnt += 1;
+    // Only update the fields here in the case where we don't support
+    // RETURNING. In cases where RETURNING is supported, the fields are updated
+    // directly in the SQL statement.
+    if (!supportsReturning) {
+      c.c_balance -= paymentAmount;
+      c.c_ytd_payment += paymentAmount;
+      c.c_payment_cnt += 1;
+    }
 
     return c;
   }
 
-  private void updateDistrict(Connection conn, int w_id, int districtID, float paymentAmount)
-      throws SQLException {
-    try (PreparedStatement payUpdateDist = this.getPreparedStatement(conn, payUpdateDistSQL)) {
-      payUpdateDist.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
-      payUpdateDist.setInt(2, w_id);
-      payUpdateDist.setInt(3, districtID);
+  private District updateAndGetDistrict(
+      Connection conn, int w_id, int districtID, float paymentAmount) throws SQLException {
+    String dbType = conn.getMetaData().getDatabaseProductName().toLowerCase();
+    District d = new District();
 
-      int result = payUpdateDist.executeUpdate();
+    if (dbType.contains("postgresql") || dbType.contains("postgres")) {
+      try (PreparedStatement payUpdateDist =
+          this.getPreparedStatement(conn, payUpdateDistSQLPostgres)) {
+        payUpdateDist.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+        payUpdateDist.setInt(2, w_id);
+        payUpdateDist.setInt(3, districtID);
 
-      if (result == 0) {
-        throw new RuntimeException("D_ID=" + districtID + " D_W_ID=" + w_id + " not found!");
-      }
-    }
-  }
+        try (ResultSet rs = payUpdateDist.executeQuery()) {
+          if (!rs.next()) {
+            throw new RuntimeException("D_ID=" + districtID + " D_W_ID=" + w_id + " not found!");
+          }
 
-  private District getDistrict(Connection conn, int w_id, int districtID) throws SQLException {
-    try (PreparedStatement payGetDist = this.getPreparedStatement(conn, payGetDistSQL)) {
-      payGetDist.setInt(1, w_id);
-      payGetDist.setInt(2, districtID);
-
-      try (ResultSet rs = payGetDist.executeQuery()) {
-        if (!rs.next()) {
-          throw new RuntimeException("D_ID=" + districtID + " D_W_ID=" + w_id + " not found!");
+          d.d_street_1 = rs.getString("D_STREET_1");
+          d.d_street_2 = rs.getString("D_STREET_2");
+          d.d_city = rs.getString("D_CITY");
+          d.d_state = rs.getString("D_STATE");
+          d.d_zip = rs.getString("D_ZIP");
+          d.d_name = rs.getString("D_NAME");
         }
+      }
+    } else if (dbType.contains("oracle")) {
+      try (PreparedStatement stmt = this.getPreparedStatement(conn, payUpdateDistSQLOracle)) {
+        // Check if it's actually an OraclePreparedStatement
+        Class<?> oraclePstmtClass = Class.forName("oracle.jdbc.OraclePreparedStatement");
+        if (oraclePstmtClass.isInstance(stmt)) {
+          // Set input parameters
+          stmt.setBigDecimal(1, BigDecimal.valueOf(paymentAmount));
+          stmt.setInt(2, w_id);
+          stmt.setInt(3, districtID);
 
-        District d = new District();
-        d.d_street_1 = rs.getString("D_STREET_1");
-        d.d_street_2 = rs.getString("D_STREET_2");
-        d.d_city = rs.getString("D_CITY");
-        d.d_state = rs.getString("D_STATE");
-        d.d_zip = rs.getString("D_ZIP");
-        d.d_name = rs.getString("D_NAME");
+          // Register output parameters using reflection
+          Method registerReturnParameter =
+              oraclePstmtClass.getMethod("registerReturnParameter", int.class, int.class);
+          for (int i = 4; i <= 9; i++) {
+            registerReturnParameter.invoke(stmt, i, Types.VARCHAR);
+          }
 
-        return d;
+          // Execute and get results
+          stmt.executeUpdate();
+
+          // Get result set via reflection
+          Method getReturnResultSet = oraclePstmtClass.getMethod("getReturnResultSet");
+          ResultSet rs = (ResultSet) getReturnResultSet.invoke(stmt);
+
+          if (rs.next()) {
+            d.d_street_1 = rs.getString(1);
+            d.d_street_2 = rs.getString(2);
+            d.d_city = rs.getString(3);
+            d.d_state = rs.getString(4);
+            d.d_zip = rs.getString(5);
+            d.d_name = rs.getString(6);
+          }
+        }
+      } catch (ClassNotFoundException
+          | NoSuchMethodException
+          | IllegalAccessException
+          | InvocationTargetException e) {
+        // FIXME: change this to be a bit more elegant
+        throw new RuntimeException("Missing proper support for Oracle");
       }
     }
+    return d;
   }
 
   private String getCData(
@@ -469,8 +953,8 @@ public class Payment extends TPCCProcedure {
       throws SQLException {
     try (PreparedStatement payUpdateCustBalCdata =
         this.getPreparedStatement(conn, payUpdateCustBalCdataSQL)) {
-      payUpdateCustBalCdata.setDouble(1, c.c_balance);
-      payUpdateCustBalCdata.setDouble(2, c.c_ytd_payment);
+      payUpdateCustBalCdata.setFloat(1, c.c_balance);
+      payUpdateCustBalCdata.setFloat(2, c.c_ytd_payment);
       payUpdateCustBalCdata.setInt(3, c.c_payment_cnt);
       payUpdateCustBalCdata.setString(4, c.c_data);
       payUpdateCustBalCdata.setInt(5, customerWarehouseID);
@@ -497,8 +981,8 @@ public class Payment extends TPCCProcedure {
 
     try (PreparedStatement payUpdateCustBal =
         this.getPreparedStatement(conn, payUpdateCustBalSQL)) {
-      payUpdateCustBal.setDouble(1, c.c_balance);
-      payUpdateCustBal.setDouble(2, c.c_ytd_payment);
+      payUpdateCustBal.setFloat(1, c.c_balance);
+      payUpdateCustBal.setFloat(2, c.c_ytd_payment);
       payUpdateCustBal.setInt(3, c.c_payment_cnt);
       payUpdateCustBal.setInt(4, customerWarehouseID);
       payUpdateCustBal.setInt(5, customerDistrictID);

@@ -21,11 +21,26 @@ import static com.oltpbenchmark.benchmarks.tpcc.TPCCConfig.*;
 
 import com.oltpbenchmark.benchmarks.tpcc.pojo.Customer;
 import com.oltpbenchmark.util.RandomGenerator;
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.sql.*;
+// import java.sql.ResultSet;
+// import java.sql.SQLException;
 import java.util.Random;
 
 public class TPCCUtil {
+
+  /**
+   * Helper method to determine if a database vendor supports the RETURNING clause. In cases where
+   * it does, we can optimize the New Order and Payments transactions.
+   *
+   * @param conn the database connection
+   * @return whether or not the vendor supports RETURNING
+   */
+  public static boolean checkIfDatabaseSupportsReturning(Connection conn) throws SQLException {
+    String dbProductName = conn.getMetaData().getDatabaseProductName().toLowerCase();
+    // For now, just support postgresql dialects and Oracle. Longer term,
+    // this should also handle Db2 and SQL Server.
+    return dbProductName.contains("postgresql") || dbProductName.contains("oracle");
+  }
 
   /**
    * Creates a Customer object from the current row in the given ResultSet. The caller is

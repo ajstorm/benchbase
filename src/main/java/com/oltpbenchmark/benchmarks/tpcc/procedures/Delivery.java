@@ -18,12 +18,13 @@
 package com.oltpbenchmark.benchmarks.tpcc.procedures;
 
 import com.oltpbenchmark.api.SQLStmt;
-import com.oltpbenchmark.benchmarks.tpcc.TPCCConfig;
 import com.oltpbenchmark.benchmarks.tpcc.TPCCConstants;
 import com.oltpbenchmark.benchmarks.tpcc.TPCCUtil;
 import com.oltpbenchmark.benchmarks.tpcc.TPCCWorker;
 import java.math.BigDecimal;
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -120,30 +121,36 @@ public class Delivery extends TPCCProcedure {
 
     int o_carrier_id = TPCCUtil.randomNumber(1, 10, gen);
 
-    int d_id;
+    List<Integer> districtIds = new ArrayList<>();
+    List<Integer> orderIds = new ArrayList<>();
+    List<Integer> customerIds = new ArrayList<>();
+    List<Float> orderLineTotals = new ArrayList<>();
 
-    int[] orderIDs = new int[10];
-
-    for (d_id = 1; d_id <= terminalDistrictUpperID; d_id++) {
+    // First pass: collect all IDs
+    for (int d_id = 1; d_id <= terminalDistrictUpperID; d_id++) {
       Integer no_o_id = getOrderId(conn, w_id, d_id);
 
       if (no_o_id == null) {
         continue;
       }
 
-      orderIDs[d_id - 1] = no_o_id;
+      // Store the necessary IDs for batch operations
+      districtIds.add(d_id);
+      orderIds.add(no_o_id);
 
+      // Store additional info needed for related operations
+      customerIds.add(getCustomerId(conn, w_id, d_id, no_o_id));
+      orderLineTotals.add(getOrderLineTotal(conn, w_id, d_id, no_o_id));
+
+      // Delete operations still need to be done individually
       deleteOrder(conn, w_id, d_id, no_o_id);
+    }
 
-      int customerId = getCustomerId(conn, w_id, d_id, no_o_id);
-
-      updateCarrierId(conn, w_id, o_carrier_id, d_id, no_o_id);
-
-      updateDeliveryDate(conn, w_id, d_id, no_o_id);
-
-      float orderLineTotal = getOrderLineTotal(conn, w_id, d_id, no_o_id);
-
-      updateBalanceAndDelivery(conn, w_id, d_id, customerId, orderLineTotal);
+    // Now perform batch operations
+    if (!orderIds.isEmpty()) {
+      updateCarrierIdBatch(conn, w_id, o_carrier_id, districtIds, orderIds);
+      updateDeliveryDateBatch(conn, w_id, districtIds, orderIds);
+      updateBalanceAndDeliveryBatch(conn, w_id, districtIds, customerIds, orderLineTotals);
     }
 
     if (LOG.isTraceEnabled()) {
@@ -157,16 +164,20 @@ public class Delivery extends TPCCProcedure {
       terminalMessage.append("\n Carrier:   ");
       terminalMessage.append(o_carrier_id);
       terminalMessage.append("\n\n Delivered Orders\n");
-      for (int i = 1; i <= TPCCConfig.configDistPerWhse; i++) {
-        if (orderIDs[i - 1] >= 0) {
-          terminalMessage.append("  District ");
-          terminalMessage.append(i < 10 ? " " : "");
-          terminalMessage.append(i);
-          terminalMessage.append(": Order number ");
-          terminalMessage.append(orderIDs[i - 1]);
-          terminalMessage.append(" was delivered.\n");
-        }
+
+      // Track which districts had deliveries
+      for (int i = 0; i < districtIds.size(); i++) {
+        int d_id = districtIds.get(i);
+        int o_id = orderIds.get(i);
+
+        terminalMessage.append("  District ");
+        terminalMessage.append(d_id < 10 ? " " : "");
+        terminalMessage.append(d_id);
+        terminalMessage.append(": Order number ");
+        terminalMessage.append(o_id);
+        terminalMessage.append(" was delivered.\n");
       }
+
       terminalMessage.append(
           "+-----------------------------------------------------------------+\n\n");
       LOG.trace(terminalMessage.toString());
@@ -240,46 +251,64 @@ public class Delivery extends TPCCProcedure {
     }
   }
 
-  private void updateCarrierId(Connection conn, int w_id, int o_carrier_id, int d_id, int no_o_id)
+  private void updateCarrierIdBatch(
+      Connection conn,
+      int w_id,
+      int o_carrier_id,
+      List<Integer> districtIds,
+      List<Integer> orderIds)
       throws SQLException {
-    try (PreparedStatement delivUpdateCarrierId =
-        this.getPreparedStatement(conn, delivUpdateCarrierIdSQL)) {
-      delivUpdateCarrierId.setInt(1, o_carrier_id);
-      delivUpdateCarrierId.setInt(2, no_o_id);
-      delivUpdateCarrierId.setInt(3, d_id);
-      delivUpdateCarrierId.setInt(4, w_id);
 
-      int result = delivUpdateCarrierId.executeUpdate();
+    StringBuilder inClause = new StringBuilder();
+    for (int i = 0; i < districtIds.size(); i++) {
+      if (i > 0) inClause.append(" OR ");
+      inClause.append("(o_d_id = ? AND o_id = ?)");
+    }
 
-      if (result != 1) {
-        String msg =
-            String.format(
-                "Failed to update ORDER record [W_ID=%d, D_ID=%d, O_ID=%d]", w_id, d_id, no_o_id);
-        throw new RuntimeException(msg);
+    String batchUpdateSQL =
+        "UPDATE oorder SET o_carrier_id = ? WHERE o_w_id = ? AND (" + inClause + ")";
+
+    try (PreparedStatement stmt = conn.prepareStatement(batchUpdateSQL)) {
+      int paramIndex = 1;
+      stmt.setInt(paramIndex++, o_carrier_id);
+      stmt.setInt(paramIndex++, w_id);
+
+      for (int i = 0; i < districtIds.size(); i++) {
+        stmt.setInt(paramIndex++, districtIds.get(i));
+        stmt.setInt(paramIndex++, orderIds.get(i));
       }
+
+      stmt.executeUpdate();
     }
   }
 
-  private void updateDeliveryDate(Connection conn, int w_id, int d_id, int no_o_id)
+  private void updateDeliveryDateBatch(
+      Connection conn, int w_id, List<Integer> districtIds, List<Integer> orderIds)
       throws SQLException {
+
     Timestamp timestamp = new Timestamp(System.currentTimeMillis());
 
-    try (PreparedStatement delivUpdateDeliveryDate =
-        this.getPreparedStatement(conn, delivUpdateDeliveryDateSQL)) {
-      delivUpdateDeliveryDate.setTimestamp(1, timestamp);
-      delivUpdateDeliveryDate.setInt(2, no_o_id);
-      delivUpdateDeliveryDate.setInt(3, d_id);
-      delivUpdateDeliveryDate.setInt(4, w_id);
+    // Construct IN clause for district_id and order_id pairs
+    StringBuilder inClause = new StringBuilder();
+    for (int i = 0; i < districtIds.size(); i++) {
+      if (i > 0) inClause.append(" OR ");
+      inClause.append("(ol_d_id = ? AND ol_o_id = ?)");
+    }
 
-      int result = delivUpdateDeliveryDate.executeUpdate();
+    String batchUpdateSQL =
+        "UPDATE order_line SET ol_delivery_d = ? WHERE ol_w_id = ? AND (" + inClause + ")";
 
-      if (result == 0) {
-        String msg =
-            String.format(
-                "Failed to update ORDER_LINE records [W_ID=%d, D_ID=%d, O_ID=%d]",
-                w_id, d_id, no_o_id);
-        throw new RuntimeException(msg);
+    try (PreparedStatement stmt = conn.prepareStatement(batchUpdateSQL)) {
+      int paramIndex = 1;
+      stmt.setTimestamp(paramIndex++, timestamp);
+      stmt.setInt(paramIndex++, w_id);
+
+      for (int i = 0; i < districtIds.size(); i++) {
+        stmt.setInt(paramIndex++, districtIds.get(i));
+        stmt.setInt(paramIndex++, orderIds.get(i));
       }
+
+      stmt.executeUpdate();
     }
   }
 
@@ -305,24 +334,29 @@ public class Delivery extends TPCCProcedure {
     }
   }
 
-  private void updateBalanceAndDelivery(
-      Connection conn, int w_id, int d_id, int c_id, float orderLineTotal) throws SQLException {
+  private void updateBalanceAndDeliveryBatch(
+      Connection conn,
+      int w_id,
+      List<Integer> districtIds,
+      List<Integer> customerIds,
+      List<Float> orderLineTotals)
+      throws SQLException {
 
-    try (PreparedStatement delivUpdateCustBalDelivCnt =
-        this.getPreparedStatement(conn, delivUpdateCustBalDelivCntSQL)) {
-      delivUpdateCustBalDelivCnt.setBigDecimal(1, BigDecimal.valueOf(orderLineTotal));
-      delivUpdateCustBalDelivCnt.setInt(2, w_id);
-      delivUpdateCustBalDelivCnt.setInt(3, d_id);
-      delivUpdateCustBalDelivCnt.setInt(4, c_id);
+    String batchUpdateSQL =
+        "UPDATE customer SET c_balance = c_balance + ?, "
+            + "c_delivery_cnt = c_delivery_cnt + 1 "
+            + "WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?";
 
-      int result = delivUpdateCustBalDelivCnt.executeUpdate();
-
-      if (result == 0) {
-        String msg =
-            String.format(
-                "Failed to update CUSTOMER record [W_ID=%d, D_ID=%d, C_ID=%d]", w_id, d_id, c_id);
-        throw new RuntimeException(msg);
+    try (PreparedStatement stmt = conn.prepareStatement(batchUpdateSQL)) {
+      for (int i = 0; i < districtIds.size(); i++) {
+        stmt.setBigDecimal(1, BigDecimal.valueOf(orderLineTotals.get(i)));
+        stmt.setInt(2, w_id);
+        stmt.setInt(3, districtIds.get(i));
+        stmt.setInt(4, customerIds.get(i));
+        stmt.addBatch();
       }
+
+      stmt.executeBatch();
     }
   }
 }
